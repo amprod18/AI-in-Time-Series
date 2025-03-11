@@ -2,6 +2,7 @@
 test.ipynb
 time_series_test.ipynb
 docs/
+for_gpt.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

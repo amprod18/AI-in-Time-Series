@@ -218,7 +218,7 @@ class GeneralizedNeuralODE(Module):
         outputs = []
         for i in range(batch_size):
             t_sorted, indices = torch.sort(t_span[i])  # Ensure monotonic time
-            x_i = odeint(self.ode_func, x[i * window_size:(i + 1) * window_size], t_sorted, method=self.solver)[-1] # Only keeping the last value of the window, maybe the other should be kept as hidden states
+            x_i = odeint(self.ode_func, x[i * window_size:(i + 1) * window_size], t_sorted, method=self.solver, rtol=1e-5, atol=1e-7)[-1] # Only keeping the last value of the window, maybe the other should be kept as hidden states
             outputs.append(x_i[torch.argsort(indices)])  # Restore original order
         
         x = torch.stack(outputs).view(batch_size, window_size, -1)

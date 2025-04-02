@@ -1,11 +1,13 @@
 import os
 import torch
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 from functools import wraps
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+from datetime import timedelta
 from deprecation import deprecated
 
 from ..data.CustomDatatypes import WindowedDataType
@@ -187,8 +189,8 @@ class LiquidModelEncapsultor:
         self._build_model()
         self.model.load_state_dict(checkpoint['model_state_dict'])
         return self
-    
-    
+
+
 class TorchSklearnifier:
     def __init__(self, model, njobs:int=0, verbose:int=1, seed:int=42, **model_kwargs) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -239,8 +241,8 @@ class TorchSklearnifier:
             green = int(255 * (t))     # Green increases from 0 to 255
             return f"#{red:02X}{green:02X}00"  # Hex format: #RRGG00 (no blue component)
     
-    def _create_loader(self, X:Tensor, y:Tensor) -> DataLoader:
-        return DataLoader(WindowedDataType(X, y, self.window_size), batch_size=self.batch_size, shuffle=self.shuffle_training_data, num_workers=self.njobs, persistent_workers=self.njobs>0, pin_memory=True, prefetch_factor=2*(self.njobs>0))
+    def _create_loader(self, X:Tensor, y:Tensor, batch_size:int) -> DataLoader:
+        return DataLoader(WindowedDataType(X, y, self.window_size), batch_size=batch_size, shuffle=self.shuffle_training_data, num_workers=self.njobs, persistent_workers=self.njobs>0, pin_memory=True, prefetch_factor=2*(self.njobs>0))
     
     # TODO: Add the possibility to use a validation dataloader
     @_with_pbar(desc='Train loop iter', unit=' batches', postfix={'Loss':np.inf})
@@ -279,7 +281,7 @@ class TorchSklearnifier:
         self.shuffle_training_data = shuffle_training_data
         self.learning_rate = learning_rate
         
-        train_loader = self._create_loader(Tensor(X_train.values), Tensor(y_train.values))
+        train_loader = self._create_loader(Tensor(X_train.values), Tensor(y_train.values), self.batch_size)
         
         self._build_model()
         
@@ -296,17 +298,75 @@ class TorchSklearnifier:
         self.is_trained = True
         return self
 
+    @staticmethod
+    def _generate_forecast_timesteps(X:DataFrame, extrapolation_steps:int):
+        time_series = X.columns[0]
+        print(time_series)
+        last_date = X[time_series].iloc[-1]
+        last_index = X.index[-1]
+        time_diff = X[time_series].iloc[-1] - X[time_series].iloc[-2]
+        
+        # Determine frequency
+        if time_diff.days >= 28:  # Assuming monthly if >= 28 days
+            freq = 'M'  # Monthly frequency
+            # Calculate approximate days in a month for the offset
+            step_size = timedelta(days=30)
+        else:
+            freq = 'D'  # Daily frequency
+            step_size = timedelta(days=1)
+        
+        # Generate future dates
+        future_dates = pd.date_range(
+            start=last_date + step_size,
+            periods=extrapolation_steps,
+            freq=freq
+        )
+        
+        # Create new DataFrame with future dates and NaN values for the series
+        future_indices = range(last_index + 1, last_index + 1 + extrapolation_steps)
+        forecast_df = pd.DataFrame({
+            time_series: future_dates,
+            time_series: [float('nan')] * extrapolation_steps  # Replace 'series' with your actual column name
+        }, index=future_indices)
+        
+        return forecast_df
+
+    @deprecated
     @_with_pbar(desc='Batches to predict', unit=' batches')
-    def predict(self, X_test:DataFrame, pbar:Union[tqdm,None]=None) -> Tensor:
+    def _predict_old(self, X_test:DataFrame, pbar:Union[tqdm,None]=None) -> Tensor:
         self.model.eval()
         self.shuffle_training_data = False
-        test_loader = self._create_loader(Tensor(X_test.values), Tensor(X_test.values)[:, 0])
+
+        test_loader = self._create_loader(Tensor(X_test.values), Tensor(X_test.values)[:, 0], 1)
                 
         with torch.no_grad():
             predictions = []
-            for batch, _ in test_loader:
-                batch = batch.to(self.device)
-                predictions.append(self.model(batch).cpu().detach())
+            for window, _ in test_loader:
+                window = window.to(self.device)
+                pred = self.model(window).cpu().detach()
+                predictions.append(pred)
+        return Tensor(np.concatenate(predictions, axis=0))
+    
+    def predict(self, X_test:DataFrame, pbar:Union[tqdm,None]=None, extrapolation_steps:int=1) -> Tensor:
+        self.model.eval()
+        self.shuffle_training_data = False
+
+        test_loader = self._create_loader(Tensor(X_test.values), Tensor(X_test.values)[:, 0], 1)
+        counter = 1
+        with torch.no_grad():
+            predictions = []
+            for i, (window, _) in enumerate(test_loader):
+                if i < (len(X_test) - extrapolation_steps - self.window_size + 1):
+                    window = window.to(self.device)
+                    pred = self.model(window)
+                    predictions.append(pred.cpu().detach())
+                else:
+                    window[0, -counter:, 1] = Tensor(np.concatenate(predictions, axis=0))[-counter:, 0]
+                    counter += 1
+                    counter = min(counter, self.window_size)
+                    window = window.to(self.device)
+                    pred = self.model(window).cpu().detach()
+                    predictions.append(pred)
         return Tensor(np.concatenate(predictions, axis=0))
     
     def score(self, X_test:DataFrame, y_test:DataFrame) -> float:
@@ -331,26 +391,48 @@ class TorchSklearnifier:
     
     # TODO: Attempt to generalize for every pytorch model
     def explain(self, y_train:Union[DataFrame,Series], X_train:Union[DataFrame,None]=None) -> 'TorchSklearnifier':
+        raise NotImplementedError
         assert self.is_trained, 'Model has not yet been trained. Train the model to generate explanations.'
         self.model.explain(y_train, self.window_size, X_train=X_train)
         return self
     
-    def _set_up_parameters(self, metadata:Dict[str,Union[object,int,float]]) -> 'TorchSklearnifier':
+    def set_params(self, metadata:Dict[str,Union[object,int,float]]) -> 'TorchSklearnifier':
         for param, value in metadata.items():
             self.__setattr__(param, value)
         return self
 
-    def save_model(self, model_path:Path) -> 'TorchSklearnifier':
-        metadata = {key:value for key, value in self.__dict__.items() if not key.startswith('__') and not callable(value)}
+    def get_params(self, deep=True):
+        return {key:value for key, value in self.__dict__.items() if not key.startswith('__') and not callable(value)}
+    
+    def save_model(self, model_path:Union[Path,str]) -> 'TorchSklearnifier':
+        metadata = self.get_params()
+        if isinstance(model_path, str):
+            model_path = Path(model_path)
         if not os.path.exists(model_path.parent):
             os.makedirs(model_path.parent)
         torch.save({'model_state_dict':self.model.state_dict(), 'metadata':metadata}, model_path)
         return self
 
-    def load_model(self, model_path:Path) -> 'TorchSklearnifier':
-        checkpoint = torch.load(model_path)
-        self._set_up_parameters(checkpoint['metadata'])
+    def load_model(self, model_path:Union[Path,str]) -> 'TorchSklearnifier':
+        if isinstance(model_path, str):
+            model_path = Path(model_path)
+        checkpoint = torch.load(model_path, weights_only=False)
+        self.set_params(checkpoint['metadata'])
         self.model_is_built = False
         self._build_model()
         self.model.load_state_dict(checkpoint['model_state_dict'])
         return self
+    
+    def __getstate__(self):
+        state = {'metadata':self.__dict__.copy()}
+        state['model_state_dict'] = self.model.state_dict()
+        del state['metadata']['model']  # Don't serialize the model object directly
+        return state
+
+    def __setstate__(self, state):
+        self.set_params(state['metadata'])
+        if 'model_state_dict' in state:
+            self.model_is_built = False
+            self._build_model()
+            self.model.load_state_dict(state['model_state_dict'])
+            self.model.eval()
